@@ -1,0 +1,191 @@
+syntax = "proto3";
+
+package powerboard;
+
+// App <-> device contract over BLE. One firmware per physical device; the device
+// reports its Profile in DeviceInfo and the app shows the matching controls.
+//
+// Connect flow (app):
+//   1. GetInfo   -> Response.info     (profile, capabilities)
+//   2. SetTime   -> Response.status   (board clock for schedules; lost on power cut)
+//   3. GetStatus / GetSchedule as needed
+//   4. Disconnect when done: battery devices stay at full power while connected.
+
+// ---------------------------------------------------------------- profile
+
+enum Profile {
+  PROFILE_UNSPECIFIED = 0;
+  // 3 relays, per-relay on/off schedules.
+  PROFILE_POWER_BOARD = 1;
+  // 1 servo button. Manual press tests: single click, multi click, long hold (Flic SOS test).
+  PROFILE_BUTTON_TESTER = 2;
+  // 1 servo button. Schedules a press at a time of day (e.g. rice cooker start).
+  PROFILE_SCHEDULED_BUTTON = 3;
+}
+
+message GetInfo {}
+
+message DeviceInfo {
+  Profile profile = 1;
+  string fw_version = 2;
+  uint32 relay_count = 3;    // valid channels 1..relay_count
+  uint32 button_count = 4;   // valid button_id 1..button_count
+  uint32 max_schedules = 5;  // valid schedule id 1..max_schedules; 0 = no scheduling
+  // Battery mode. 0 = always on. Otherwise, while disconnected, the board deep-sleeps up to
+  // sleep_interval_s, wakes and advertises for awake_window_ms, then sleeps again (it also
+  // wakes for schedules). App should scan >= sleep_interval_s + awake_window_ms to find it.
+  uint32 sleep_interval_s = 6;
+  uint32 awake_window_ms = 7;
+  // Board drops a connection with no request for this long, so a forgotten app
+  // cannot hold it awake. 0 = never. App should disconnect when the user leaves the device.
+  uint32 idle_disconnect_s = 8;
+}
+
+// ---------------------------------------------------------------- relays
+
+// Relay channel. Numbering matches the relay module silkscreen.
+enum Channel {
+  CHANNEL_UNSPECIFIED = 0;
+  CHANNEL_1 = 1;  // GPIO1
+  CHANNEL_2 = 2;  // GPIO3
+  CHANNEL_3 = 3;  // GPIO4
+}
+
+// Loads are wired COM -> NC.
+// power_on = true  : relay coil de-energised, COM-NC closed, load powered (boot default)
+// power_on = false : relay coil energised,    COM-NC open,   load cut
+message RelayState {
+  Channel channel = 1;
+  bool power_on = 2;
+}
+
+message SetRelay {
+  Channel channel = 1;
+  bool power_on = 2;
+}
+
+message GetStatus {}
+
+// ---------------------------------------------------------------- buttons
+
+// Servo button pusher: press a physical button press_count times.
+// One press = push down, hold hold_ms, release. Presses are gap_ms apart (released time).
+//   single click : {button_id: 1, press_count: 1, hold_ms: 1000}
+//   double tap   : {button_id: 1, press_count: 2, hold_ms: 750, gap_ms: 250}  -> 1.75 s
+//   long press   : {button_id: 1, press_count: 1, hold_ms: 6000}
+// hold_ms / gap_ms exclude servo travel (~125 ms each way).
+// Accepted immediately; the board notifies a seq=0 Response with Status when the press ends.
+message PressButton {
+  uint32 button_id = 1;    // 1-based
+  uint32 press_count = 2;  // 0 treated as 1, max 10
+  uint32 hold_ms = 3;      // 50..30000
+  uint32 gap_ms = 4;       // 0 = default 250, else 100..10000; ignored for press_count 1
+}
+
+// Abort a running press and release the button.
+message StopButton {
+  uint32 button_id = 1;
+}
+
+// ---------------------------------------------------------------- time + schedules
+
+// Set board clock. App sends on every connect. Board has no battery RTC or Wi-Fi:
+// after a power cut the clock is unset and schedules pause until the next SetTime.
+message SetTime {
+  uint64 unix_s = 1;          // UTC seconds
+  sint32 utc_offset_min = 2;  // local = UTC + offset, e.g. +600 for AEST. Persisted.
+}
+
+// Action a schedule runs. Must match the profile (relay on power board, press on button profiles).
+message RelayAction {
+  Channel channel = 1;
+  bool power_on = 2;
+}
+
+// Fires at minute_of_day local time.
+//   weekdays != 0 : repeats on those days. Bit 0 = Monday ... bit 6 = Sunday. 0x7F = every day.
+//   weekdays == 0 : one-shot at the next occurrence, then the board sets enabled = false.
+// Missed while unpowered or clock unset = skipped, never run late.
+message Schedule {
+  uint32 id = 1;  // slot 1..DeviceInfo.max_schedules
+  bool enabled = 2;
+  uint32 minute_of_day = 3;  // 0..1439, local time
+  uint32 weekdays = 4;
+  oneof action {
+    RelayAction relay = 5;
+    PressButton press = 6;
+  }
+}
+
+// Create or replace the schedule in slot schedule.id. Persisted in flash.
+message SetSchedule {
+  Schedule schedule = 1;
+}
+
+message DeleteSchedule {
+  uint32 id = 1;
+}
+
+// Read one slot. Status.schedule_mask says which slots are in use.
+message GetSchedule {
+  uint32 id = 1;
+}
+
+// ---------------------------------------------------------------- framing
+
+// Mobile -> board (written to the RX characteristic)
+message Request {
+  uint32 seq = 1;
+  oneof payload {
+    SetRelay set_relay = 2;
+    GetStatus get_status = 3;
+    PressButton press_button = 4;
+    StopButton stop_button = 5;
+    GetInfo get_info = 6;
+    SetTime set_time = 7;
+    SetSchedule set_schedule = 8;
+    DeleteSchedule delete_schedule = 9;
+    GetSchedule get_schedule = 10;
+  }
+}
+
+message ButtonState {
+  uint32 button_id = 1;
+  bool pressing = 2;  // true while a PressButton sequence is running
+}
+
+message Status {
+  repeated RelayState relays = 1;
+  uint32 uptime_s = 2;
+  repeated ButtonState buttons = 3;
+  uint64 unix_s = 4;          // board UTC clock, 0 = not set (send SetTime)
+  uint32 schedule_mask = 5;   // bit (id - 1) set = slot in use
+  sint32 utc_offset_min = 6;
+}
+
+enum ErrorCode {
+  ERROR_NONE = 0;
+  ERROR_DECODE = 1;
+  ERROR_BAD_CHANNEL = 2;
+  ERROR_UNKNOWN_REQUEST = 3;
+  ERROR_BAD_BUTTON = 4;    // no such button_id
+  ERROR_BAD_ARGS = 5;      // field out of range
+  ERROR_BUSY = 6;          // button already pressing; send StopButton first
+  ERROR_UNSUPPORTED = 7;   // request not available on this profile
+  ERROR_BAD_SCHEDULE = 8;  // bad slot id, empty slot, or action wrong for profile
+  ERROR_STORAGE = 9;       // flash write failed
+}
+
+// Board -> mobile (notified on the TX characteristic).
+// seq = 0 marks an unsolicited notification (press finished, schedule fired).
+// Payload: info for GetInfo, schedule for GetSchedule, status for everything else
+// (including errors), so the app stays in sync.
+message Response {
+  uint32 seq = 1;
+  ErrorCode error = 2;
+  oneof payload {
+    Status status = 3;
+    DeviceInfo info = 4;
+    Schedule schedule = 5;
+  }
+}

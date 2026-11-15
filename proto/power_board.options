@@ -1,0 +1,3 @@
+powerboard.Status.relays max_count:3 fixed_count:false
+powerboard.Status.buttons max_count:4 fixed_count:false
+powerboard.DeviceInfo.fw_version max_size:16

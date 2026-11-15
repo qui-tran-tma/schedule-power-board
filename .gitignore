@@ -1,0 +1,8 @@
+.pio/
+.vscode/
+!.vscode/extensions.json
+*.pb.c
+*.pb.h
+.DS_Store
+__pycache__/
+*.pyc
